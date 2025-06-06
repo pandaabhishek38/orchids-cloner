@@ -3,14 +3,22 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Dict, List
 import uvicorn
-from app.cloner import scrape_website, generate_html_from_context
+#from app.cloner import scrape_website, generate_html_from_context
 from app.rendered_scraper import get_rendered_html
+from fastapi import HTTPException
+from collections import Counter
+from collections import defaultdict
 import logging
+import re
+import os
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-
 
 # Create FastAPI instance
 app = FastAPI(
@@ -22,37 +30,482 @@ app = FastAPI(
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production, replace with specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Pydantic models
-
-
-class Item(BaseModel):
-    id: int
-    name: str
-    description: str = None
-
-
-class ItemCreate(BaseModel):
-    name: str
-    description: str = None
-
-
-# In-memory storage for demo purposes
-items_db: List[Item] = [
-    Item(id=1, name="Sample Item", description="This is a sample item"),
-    Item(id=2, name="Another Item", description="This is another sample item")
-]
-
-# Root endpoint
-
 class CloneRequest(BaseModel):
     url: str
 
+def generate_html_phased(prompt_parts: dict, screenshot_b64: str) -> str:
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    # Phase 1: Layout
+    layout_prompt = f"""
+You are a web layout expert. Based on the following screenshot and layout summary, generate only the HTML structure of the page. Do not add any CSS or styling.
+
+Screenshot:
+[screenshot]
+
+Layout Summary:
+{prompt_parts['layout_summary']}
+
+Visible Content Summary:
+{prompt_parts['visible_text']}
+
+Output only raw HTML with semantic tags (header, main, section, nav, footer, etc.). Do not style.
+"""
+
+    logger.info("Starting Phase 1: Layout")
+
+    phase1 = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 3000,
+        "temperature": 0.7,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": layout_prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64
+                        }
+                    }
+                ]
+            }
+        ]
+    })
+    phase1_html = phase1.json()["content"][0]["text"]
+    logger.info(f"Phase 1 HTML length: {len(phase1_html)}")
+
+    # Phase 2: Styling
+    styling_prompt = f"""
+You are a frontend developer. Apply internal CSS to the following raw HTML layout using the provided design system. Your goal is to recreate the original look and feel of the target website.
+
+🎨 Color Palette:
+- Apply the most dominant background color to the <body> or <main>
+- Use secondary background colors for <nav>, <footer>, and section blocks
+- Assign text colors to <p>, <a>, and all heading tags
+{prompt_parts['color_summary']}
+
+🔤 Typography:
+- Use primary fonts across the page
+- Apply bold weights and large sizes to <h1> and <h2>
+- Use smaller, readable fonts for <p> and <a>
+{prompt_parts['typography_summary']}
+
+📐 Layout Tokens:
+{prompt_parts['layout_tokens']}
+
+📏 Spacing System:
+- Use margin and padding values between sections and around text blocks
+- Keep spacing consistent across buttons, headers, and content areas
+{prompt_parts['spacing_tokens']}
+
+🛠 Instructions:
+- Insert a <style> tag inside the <head> of the HTML
+- Apply styles using CSS selectors — not inline styles
+- Add class names if necessary for cleaner styling
+- **Do not alter the HTML structure**
+- Style should be visible and representative of a real website
+
+✅ Final Check:
+Before submitting:
+- Confirm that the <style> tag is included
+- Apply all key colors and fonts
+- Visually style at least one heading, one link, one button, and one section
+
+Here is the HTML layout:
+{phase1_html}
+"""
+
+    logger.info("Starting Phase 2: Styling")
+
+    phase2 = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 3500,
+        "temperature": 0.7,
+        "messages": [{"role": "user", "content": styling_prompt}]
+    })
+    phase2_html = phase2.json()["content"][0]["text"]
+    logger.info(f"Phase 2 HTML length: {len(phase2_html)}")
+
+    # Phase 3: Content Filling
+    content_prompt = f"""
+You are a web content assistant. Fill in the text content into the following HTML structure. Preserve the layout and styles. Use this visible content summary:
+
+{prompt_parts['visible_text']}
+
+Do not change the HTML structure or styles. Just insert the correct content into the appropriate sections.
+
+HTML:
+{phase2_html}
+"""
+
+    logger.info("Starting Phase 3: Content Filling")
+
+    phase3 = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json={
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 3500,
+        "temperature": 0.7,
+        "messages": [{"role": "user", "content": content_prompt}]
+    })
+    final_html = phase3.json()["content"][0]["text"]
+    logger.info(f"Final HTML length: {len(final_html)}")
+
+    return final_html
+
+
+def summarize_spacing_system(computed_styles: str) -> dict:
+    margin_values = []
+    padding_values = []
+
+    for line in computed_styles.split("\n"):
+        line = line.strip()
+        if "margin" in line and ":" in line and "auto" not in line:
+            values = re.findall(r"(\d+px)", line)
+            margin_values.extend(values)
+
+        if "padding" in line and ":" in line:
+            values = re.findall(r"(\d+px)", line)
+            padding_values.extend(values)
+
+    margin_counts = Counter(margin_values).most_common(5)
+    padding_counts = Counter(padding_values).most_common(5)
+
+    return {
+        "common_margins": [m[0] for m in margin_counts],
+        "common_paddings": [p[0] for p in padding_counts]
+    }
+
+
+def summarize_layout_system(computed_styles: str) -> dict:
+    layout_methods = {
+        "flex": 0,
+        "grid": 0,
+        "block": 0,
+        "inline-block": 0,
+        "absolute": 0,
+        "relative": 0,
+        "fixed": 0,
+        "sticky": 0,
+        "float": 0
+    }
+
+    for line in computed_styles.split("\n"):
+        line = line.strip()
+
+        if "display:" in line:
+            if "flex" in line:
+                layout_methods["flex"] += 1
+            elif "grid" in line:
+                layout_methods["grid"] += 1
+            elif "block" in line:
+                layout_methods["block"] += 1
+            elif "inline-block" in line:
+                layout_methods["inline-block"] += 1
+
+        if "position:" in line:
+            if "absolute" in line:
+                layout_methods["absolute"] += 1
+            elif "relative" in line:
+                layout_methods["relative"] += 1
+            elif "fixed" in line:
+                layout_methods["fixed"] += 1
+            elif "sticky" in line:
+                layout_methods["sticky"] += 1
+
+        if "float:" in line:
+            layout_methods["float"] += 1
+
+    # Filter to top used layout methods
+    layout_summary = {k: v for k, v in layout_methods.items() if v > 0}
+    return layout_summary
+
+
+
+def summarize_typography(computed_styles: str) -> dict:
+    fonts = []
+    font_sizes = []
+    font_weights = []
+
+    for line in computed_styles.split("\n"):
+        line = line.strip()
+
+        if "font-family" in line:
+            match = re.search(r"font-family:\s*([^;]+);", line)
+            if match:
+                fonts.append(match.group(1).strip())
+
+        elif "font-size" in line:
+            match = re.search(r"font-size:\s*([^;]+);", line)
+            if match:
+                font_sizes.append(match.group(1).strip())
+
+        elif "font-weight" in line:
+            match = re.search(r"font-weight:\s*([^;]+);", line)
+            if match:
+                font_weights.append(match.group(1).strip())
+
+    # Count most common items
+    top_fonts = Counter(fonts).most_common(3)
+    top_sizes = Counter(font_sizes).most_common(3)
+    top_weights = Counter(font_weights).most_common(3)
+
+    return {
+        "font_families": [f[0] for f in top_fonts],
+        "font_sizes": [s[0] for s in top_sizes],
+        "font_weights": [w[0] for w in top_weights],
+    }
+
+
+def summarize_color_palette(computed_styles: str) -> dict:
+    bg_colors = []
+    text_colors = []
+    link_colors = []
+
+    for line in computed_styles.split("\n"):
+        line = line.strip()
+
+        if "background-color" in line and "rgb" in line:
+            color = re.search(r"rgb[a]?\([^)]+\)", line)
+            if color:
+                bg_colors.append(color.group())
+
+        elif re.match(r"\s*color\s*:\s*rgb", line):
+            color = re.search(r"rgb[a]?\([^)]+\)", line)
+            if color:
+                text_colors.append(color.group())
+
+        elif "a {" in line or "a:" in line:
+            if "color:" in line:
+                color = re.search(r"rgb[a]?\([^)]+\)", line)
+                if color:
+                    link_colors.append(color.group())
+
+    top_bg = Counter(bg_colors).most_common(3)
+    top_text = Counter(text_colors).most_common(3)
+    top_links = Counter(link_colors).most_common(3)
+
+    return {
+        "background_colors": [c[0] for c in top_bg],
+        "text_colors": [c[0] for c in top_text],
+        "link_colors": [c[0] for c in top_links]
+    }
+
+def generate_html_with_claude(prompt: str, screenshot_b64: str) -> str:
+    headers = {
+        "x-api-key": ANTHROPIC_API_KEY,
+        "anthropic-version": "2023-06-01",
+        "content-type": "application/json"
+    }
+
+    data = {
+        "model": "claude-3-opus-20240229",
+        "max_tokens": 4000,
+        "temperature": 0.7,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64
+                        }
+                    }
+                ]
+            }
+        ]
+    }
+
+    response = requests.post("https://api.anthropic.com/v1/messages", headers=headers, json=data)
+
+    if response.status_code != 200:
+        raise Exception(f"Claude API error: {response.status_code} - {response.text}")
+
+    output = response.json()
+    return output["content"][0]["text"]
+
+
+def extract_section_styles(computed_styles: str) -> dict:
+    """Extract styles organized by page sections"""
+    sections = {
+        'header': {'bg': [], 'text': [], 'fonts': []},
+        'main': {'bg': [], 'text': [], 'fonts': []},
+        'body': {'bg': [], 'text': [], 'fonts': []},
+        'nav': {'bg': [], 'text': [], 'fonts': []},
+        'footer': {'bg': [], 'text': [], 'fonts': []},
+        'buttons': {'bg': [], 'text': [], 'fonts': []},
+        'general': {'bg': [], 'text': [], 'fonts': []}
+    }
+
+    current_section = 'general'
+    lines = computed_styles.split('\n')
+
+    for line in lines:
+        line = line.strip()
+
+        # Detect section changes based on comments
+        if '/*' in line and '*/' in line:
+            line_lower = line.lower()
+            if 'header' in line_lower:
+                current_section = 'header'
+            elif 'main' in line_lower:
+                current_section = 'main'
+            elif 'body' in line_lower:
+                current_section = 'body'
+            elif 'nav' in line_lower:
+                current_section = 'nav'
+            elif 'footer' in line_lower:
+                current_section = 'footer'
+            elif 'button' in line_lower:
+                current_section = 'buttons'
+            else:
+                current_section = 'general'
+            continue
+
+        # Extract colors and fonts for current section
+        if 'background-color:' in line and 'rgb' in line:
+            color = line.split(':')[1].strip().rstrip(';')
+            if 'rgba(0, 0, 0, 0)' not in color and color not in sections[current_section]['bg']:
+                sections[current_section]['bg'].append(color)
+        elif 'color:' in line and 'rgb' in line:
+            color = line.split(':')[1].strip().rstrip(';')
+            if color not in sections[current_section]['text']:
+                sections[current_section]['text'].append(color)
+        elif 'font-family:' in line:
+            font = line.split(':')[1].strip().rstrip(';')
+            if font not in sections[current_section]['fonts']:
+                sections[current_section]['fonts'].append(font)
+
+    return sections
+
+def extract_layout_patterns(html_structure: str) -> dict:
+    """Extract common layout patterns and class names"""
+    patterns = {
+        'containers': [],
+        'headers': [],
+        'navigation': [],
+        'buttons': [],
+        'cards': [],
+        'sections': []
+    }
+
+    # Find class patterns
+    class_matches = re.findall(r'class="([^"]*)"', html_structure)
+    for classes in class_matches:
+        class_list = classes.split()
+        for cls in class_list:
+            if any(word in cls.lower() for word in ['container', 'wrap', 'main']):
+                if cls not in patterns['containers']:
+                    patterns['containers'].append(cls)
+            elif any(word in cls.lower() for word in ['header', 'hero', 'banner']):
+                if cls not in patterns['headers']:
+                    patterns['headers'].append(cls)
+            elif any(word in cls.lower() for word in ['nav', 'menu']):
+                if cls not in patterns['navigation']:
+                    patterns['navigation'].append(cls)
+            elif any(word in cls.lower() for word in ['btn', 'button']):
+                if cls not in patterns['buttons']:
+                    patterns['buttons'].append(cls)
+            elif any(word in cls.lower() for word in ['card', 'item', 'product']):
+                if cls not in patterns['cards']:
+                    patterns['cards'].append(cls)
+            elif any(word in cls.lower() for word in ['section', 'block', 'area']):
+                if cls not in patterns['sections']:
+                    patterns['sections'].append(cls)
+
+    return patterns
+
+def create_enhanced_prompt(visible_text: str, html_structure: str, section_styles: dict, layout_patterns: dict, layout_summary: str) -> str:
+    """Create a section-aware prompt with better styling instructions"""
+
+    # Limit content
+    text_content = visible_text[:1200]
+    html_content = html_structure[:2500]
+
+    # Build section-specific styles
+    style_instructions = []
+
+    # Header/Hero section
+    if section_styles['header']['bg'] or section_styles['header']['text']:
+        header_bg = section_styles['header']['bg'][0] if section_styles['header']['bg'] else 'rgb(0, 0, 0)'
+        header_text = section_styles['header']['text'][0] if section_styles['header']['text'] else 'rgb(255, 255, 255)'
+        style_instructions.append(f"Header/Hero section: background {header_bg}, text color {header_text}")
+
+    # Main content area
+    if section_styles['main']['bg'] or section_styles['body']['bg']:
+        main_bg = (section_styles['main']['bg'] + section_styles['body']['bg'])[0] if (section_styles['main']['bg'] + section_styles['body']['bg']) else 'rgb(255, 255, 255)'
+        main_text = (section_styles['main']['text'] + section_styles['body']['text'])[0] if (section_styles['main']['text'] + section_styles['body']['text']) else 'rgb(0, 0, 0)'
+        style_instructions.append(f"Main content: background {main_bg}, text color {main_text}")
+
+    # Navigation
+    if section_styles['nav']['bg'] or section_styles['nav']['text']:
+        nav_bg = section_styles['nav']['bg'][0] if section_styles['nav']['bg'] else 'transparent'
+        nav_text = section_styles['nav']['text'][0] if section_styles['nav']['text'] else 'inherit'
+        style_instructions.append(f"Navigation: background {nav_bg}, text color {nav_text}")
+
+    # Buttons
+    if section_styles['buttons']['bg'] or section_styles['buttons']['text']:
+        btn_bg = section_styles['buttons']['bg'][0] if section_styles['buttons']['bg'] else 'rgb(0, 123, 255)'
+        btn_text = section_styles['buttons']['text'][0] if section_styles['buttons']['text'] else 'rgb(255, 255, 255)'
+        style_instructions.append(f"Buttons: background {btn_bg}, text color {btn_text}")
+
+    # Footer
+    if section_styles['footer']['bg'] or section_styles['footer']['text']:
+        footer_bg = section_styles['footer']['bg'][0] if section_styles['footer']['bg'] else 'rgb(248, 249, 250)'
+        footer_text = section_styles['footer']['text'][0] if section_styles['footer']['text'] else 'rgb(108, 117, 125)'
+        style_instructions.append(f"Footer: background {footer_bg}, text color {footer_text}")
+
+    # Get primary font
+    all_fonts = []
+    for section in section_styles.values():
+        all_fonts.extend(section['fonts'])
+    primary_font = all_fonts[0] if all_fonts else 'Arial, sans-serif'
+
+    prompt = f"""Create a complete HTML page that recreates this website design.
+
+CONTENT:
+{text_content}
+
+SECTION STYLING:
+{chr(10).join(style_instructions)}
+Primary font: {primary_font}
+
+LAYOUT INFO: {layout_summary}
+
+KEY CLASSES FOUND: {', '.join(layout_patterns['containers'][:3] + layout_patterns['headers'][:2] + layout_patterns['buttons'][:2])}
+
+HTML STRUCTURE REFERENCE:
+{html_content}
+
+INSTRUCTIONS:
+1. Create complete HTML with DOCTYPE
+2. Use internal CSS in <style> tags
+3. Apply the section-specific colors above
+4. Use the class names from the original
+5. Create distinct visual sections (header, main, footer)
+6. Style buttons, navigation, and content areas differently
+7. Make text readable with proper contrast
+8. Include proper spacing and layout
+
+Generate the complete HTML:"""
+
+    return prompt
 
 @app.post("/clone")
 async def clone_site(request: CloneRequest):
@@ -60,57 +513,104 @@ async def clone_site(request: CloneRequest):
         logger.info(f"Starting to clone: {request.url}")
 
         # Get rendered HTML and other data
-        rendered_html, screenshot_b64, layout_summary, style_text = await get_rendered_html(request.url)
+        rendered_html, screenshot_b64, layout_summary, style_text, visible_text_summary, computed_styles_str = await get_rendered_html(request.url)
 
-        logger.info(f"Layout summary: {layout_summary}")
-        logger.info(f"Style text length: {len(style_text)}")
-        logger.info(f"Rendered HTML length: {len(rendered_html)}")
+        palette = summarize_color_palette(computed_styles_str)
+        logger.info(f"Color palette: {palette}")
 
-        # Create a more focused prompt
-        # Truncate content more intelligently
-        max_html_length = 3000
-        max_style_length = 800
+        typography = summarize_typography(computed_styles_str)
+        logger.info(f"Typography summary: {typography}")
 
-        # Truncate HTML at a reasonable point (try to end at a complete tag)
-        truncated_html = rendered_html[:max_html_length]
-        if len(rendered_html) > max_html_length:
-            # Try to find the last complete tag
-            last_tag_end = truncated_html.rfind('>')
-            if last_tag_end > max_html_length - 500:  # If we're close to the end
-                truncated_html = truncated_html[:last_tag_end + 1]
+        layout_info = summarize_layout_system(computed_styles_str)
+        logger.info(f"Layout system detected: {layout_info}")
 
-        # Truncate styles more safely
-        truncated_styles = style_text[:max_style_length]
-        if len(style_text) > max_style_length:
-            # Try to end at a complete CSS rule
-            last_brace = truncated_styles.rfind('}')
-            if last_brace > max_style_length - 200:
-                truncated_styles = truncated_styles[:last_brace + 1]
+        spacing_info = summarize_spacing_system(computed_styles_str)
+        logger.info(f"Spacing system: {spacing_info}")
 
-        prompt = f"""You are a frontend engineer tasked with creating a visually similar website clone.
+        color_summary = f"""
+        DESIGN SYSTEM:
+        - Primary background colors: {', '.join(palette['background_colors'])}
+        - Primary text colors: {', '.join(palette['text_colors'])}
+        - Link colors: {', '.join(palette['link_colors'])}
+        """
+        typography_summary = f"""
+        TYPOGRAPHY SYSTEM:
+        - Font families: {', '.join(typography['font_families'])}
+        - Font sizes: {', '.join(typography['font_sizes'])}
+        - Font weights: {', '.join(typography['font_weights'])}
+        """
+        layout_summary_text = f"""
+        LAYOUT SYSTEM:
+        {', '.join(f"{key}: {val} uses" for key, val in layout_info.items())}
+        """
+        spacing_summary_text = f"""
+        SPACING SYSTEM:
+        - Common margins: {', '.join(spacing_info['common_margins'])}
+        - Common paddings: {', '.join(spacing_info['common_paddings'])}
+        """
 
-LAYOUT SUMMARY: {layout_summary}
 
-CSS STYLES:
-{truncated_styles}
+        # Construct multimodal prompt
+        multimodal_prompt = f"""
+        You are an expert web UI designer.
 
-HTML STRUCTURE:
-{truncated_html}
+        Here is a base64 screenshot of the target website:
+        [screenshot]
+        {"" if not screenshot_b64 else screenshot_b64[:100]}... (truncated)
 
-Instructions:
-1. Create a complete HTML page that mimics the structure and styling
-2. Use inline styles or internal CSS in a <style> tag
-3. Focus on the main layout, colors, and typography
-4. Make it responsive and clean
-5. Do NOT include any <script> tags or JavaScript
-6. Return only valid HTML code
+        Layout Summary:
+        {layout_summary}
 
-Generate the HTML now:"""
+        Extracted CSS Styles:
+        {style_text[:1000]}...
 
-        logger.info("Sending prompt to LLM...")
+        Visible Content Summary:
+        {visible_text_summary}
+
+        {color_summary}
+        {typography_summary}
+        {layout_summary_text}
+        {spacing_summary_text}
+
+
+        Task:
+        Generate a single HTML file that replicates the original website's visual layout, structure, and styling as closely as possible. Use the screenshot to preserve spatial hierarchy and design. Use the layout summary and CSS to guide structure. Use visible content text where appropriate.
+        """
+
+
+        logger.info(f"Data extracted successfully")
+
+        # Extract section-specific styles
+        section_styles = extract_section_styles(computed_styles_str)
+
+        # Extract layout patterns
+        layout_patterns = extract_layout_patterns(rendered_html)
+
+        logger.info(f"Section styles: {section_styles}")
+        logger.info(f"Layout patterns: {layout_patterns}")
+
+        # Create enhanced prompt
+        prompt = create_enhanced_prompt(
+            visible_text_summary,
+            rendered_html,
+            section_styles,
+            layout_patterns,
+            layout_summary
+        )
+
+        logger.info(f"Prompt created, length: {len(prompt)}")
 
         # Generate HTML using the LLM
-        html = generate_html_from_context(prompt)
+        prompt_parts = {
+            "layout_summary": layout_summary,
+            "color_summary": color_summary,
+            "typography_summary": typography_summary,
+            "layout_tokens": layout_summary_text,
+            "spacing_tokens": spacing_summary_text,
+            "visible_text": visible_text_summary
+        }
+        html = generate_html_phased(prompt_parts, screenshot_b64)
+
 
         logger.info(f"Generated HTML length: {len(html)}")
 
@@ -118,10 +618,28 @@ Generate the HTML now:"""
             logger.error("LLM returned empty response")
             raise HTTPException(status_code=500, detail="LLM returned empty response")
 
-        # Basic validation that we got HTML
+        # Check if we got a refusal
+        if any(word in html.lower() for word in ["can't", "cannot", "basic structure", "not possible", "too complex"]):
+            logger.warning("LLM refused, trying fallback")
+
+            # Simplified fallback
+            fallback_prompt = f"""Create an HTML page with this content:
+
+{visible_text_summary[:800]}
+
+Make it look good with:
+- Dark header with white text
+- Light main content with dark text
+- Styled buttons and sections
+- Proper spacing and fonts
+
+Complete HTML with internal CSS:"""
+
+            html = generate_html_from_context(fallback_prompt)
+
+        # Ensure we have valid HTML
         if not ("<html" in html.lower() or "<!doctype" in html.lower()):
-            logger.warning("Response doesn't look like HTML, wrapping it...")
-            html = f"<html><head><title>Cloned Site</title></head><body>{html}</body></html>"
+            html = f"<!DOCTYPE html><html><head><title>Cloned Site</title></head><body>{html}</body></html>"
 
         return {"html": html, "status": "success"}
 
@@ -129,69 +647,13 @@ Generate the HTML now:"""
         logger.error(f"Error in clone_site: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Failed to clone website: {str(e)}")
 
-
-
 @app.get("/")
 async def root():
     return {"message": "Hello from FastAPI backend!", "status": "running"}
 
-# Health check endpoint
-
-
 @app.get("/health")
 async def health_check():
     return {"status": "healthy", "service": "orchids-challenge-api"}
-
-# Get all items
-
-
-@app.get("/items", response_model=List[Item])
-async def get_items():
-    return items_db
-
-# Get item by ID
-
-
-@app.get("/items/{item_id}", response_model=Item)
-async def get_item(item_id: int):
-    for item in items_db:
-        if item.id == item_id:
-            return item
-    return {"error": "Item not found"}
-
-# Create new item
-
-
-@app.post("/items", response_model=Item)
-async def create_item(item: ItemCreate):
-    new_id = max([item.id for item in items_db], default=0) + 1
-    new_item = Item(id=new_id, **item.dict())
-    items_db.append(new_item)
-    return new_item
-
-# Update item
-
-
-@app.put("/items/{item_id}", response_model=Item)
-async def update_item(item_id: int, item: ItemCreate):
-    for i, existing_item in enumerate(items_db):
-        if existing_item.id == item_id:
-            updated_item = Item(id=item_id, **item.dict())
-            items_db[i] = updated_item
-            return updated_item
-    return {"error": "Item not found"}
-
-# Delete item
-
-
-@app.delete("/items/{item_id}")
-async def delete_item(item_id: int):
-    for i, item in enumerate(items_db):
-        if item.id == item_id:
-            deleted_item = items_db.pop(i)
-            return {"message": f"Item {item_id} deleted successfully", "deleted_item": deleted_item}
-    return {"error": "Item not found"}
-
 
 def main():
     """Run the application"""
@@ -201,7 +663,6 @@ def main():
         port=8000,
         reload=True
     )
-
 
 if __name__ == "__main__":
     main()
