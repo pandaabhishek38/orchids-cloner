@@ -6,7 +6,8 @@ from pathlib import Path
 from openai import OpenAI
 
 # Load API key from .env
-load_dotenv()
+env_path = Path(__file__).resolve().parent.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 # openai.api_key = os.getenv("OPENAI_API_KEY")
 
 def scrape_website(url: str) -> str:
