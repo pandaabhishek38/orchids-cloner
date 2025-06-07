@@ -3,7 +3,9 @@ from playwright.async_api import async_playwright
 from bs4 import BeautifulSoup
 import re
 import logging
-import json
+import os
+import requests
+from urllib.parse import urljoin, urlparse
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -64,7 +66,7 @@ async def get_comprehensive_styles(page) -> str:
 
     try:
         # Get computed styles for key elements with more detailed extraction
-        styles_info = await page.evaluate("""
+        style_data = await page.evaluate("""
             () => {
                 function getElementStyles(selector, label) {
                     const elements = document.querySelectorAll(selector);
@@ -251,10 +253,28 @@ async def get_comprehensive_styles(page) -> str:
                         }
                     }
                 });
-
-                return results;
+                // Simulate hover states and capture hover styles
+                const hoverStyles = {};
+                const buttons = document.querySelectorAll('button, .btn, [class*="button"]');
+                buttons.forEach((btn, idx) => {
+                    try {
+                        btn.dispatchEvent(new MouseEvent('mouseover'));
+                        const hoverStyle = window.getComputedStyle(btn);
+                        hoverStyles[`button-${idx}-hover`] = {
+                            backgroundColor: hoverStyle.backgroundColor,
+                            color: hoverStyle.color
+                        };
+                        btn.dispatchEvent(new MouseEvent('mouseout'));
+                    } catch (e) {
+                        // Safe fallback if hover simulation fails
+                    }
+                });
+                return { styles: results, hoverStyles: hoverStyles };
             }
         """)
+        styles_info = style_data.get("styles", [])
+        hover_styles = style_data.get("hoverStyles", {})
+
 
         # Format the styles information with better organization
         formatted_styles = []
@@ -312,13 +332,13 @@ async def get_comprehensive_styles(page) -> str:
                 formatted_styles.extend(all_props)
                 formatted_styles.append("}")
 
-        return "\n".join(formatted_styles)
+        return styles_info, "\n".join(formatted_styles)
 
     except Exception as e:
         logger.warning(f"Could not extract comprehensive styles: {str(e)}")
         return ""
 
-async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str]:
+async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str, str, dict, list]:
     logger.info(f"Starting to scrape: {url}")
 
     async with async_playwright() as p:
@@ -335,6 +355,59 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str]:
 
             # Wait a bit more for dynamic content and styles to load
             await page.wait_for_timeout(5000)
+
+            section_colors = await page.evaluate("""
+            () => {
+                const sections = ['header', 'main', 'nav', 'footer', 'body'];
+                const result = {};
+                sections.forEach(tag => {
+                    const el = document.querySelector(tag);
+                    if (el) {
+                        const styles = getComputedStyle(el);
+                        result[tag] = {
+                            background: styles.backgroundColor,
+                            text: styles.color
+                        };
+                    }
+                });
+                return result;
+            }
+            """)
+
+            # Detect common interactive JavaScript elements
+            js_behavior_summary = await page.evaluate("""
+            () => {
+                const interactions = [];
+
+                const sliders = document.querySelectorAll('[class*="slider"], [class*="carousel"], [class*="swiper"]');
+                if (sliders.length > 0) {
+                    interactions.push(`Found ${sliders.length} sliders/carousels`);
+                }
+
+                const modals = document.querySelectorAll('[class*="modal"], [class*="popup"]');
+                if (modals.length > 0) {
+                    interactions.push(`Detected ${modals.length} modal/popup components`);
+                }
+
+                const accordions = document.querySelectorAll('[class*="accordion"]');
+                if (accordions.length > 0) {
+                    interactions.push(`Page includes ${accordions.length} accordions`);
+                }
+
+                const dropdowns = document.querySelectorAll('select, [class*="dropdown"]');
+                if (dropdowns.length > 0) {
+                    interactions.push(`Detected ${dropdowns.length} dropdowns`);
+                }
+
+                const tabs = document.querySelectorAll('[role="tab"], [class*="tab"]');
+                if (tabs.length > 0) {
+                    interactions.push(`Tabbed navigation with ${tabs.length} tabs`);
+                }
+
+                return interactions.join(' | ');
+            }
+            """)
+
 
             # Extract visible text content with better structure preservation
             try:
@@ -361,7 +434,7 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str]:
 
             # Get comprehensive computed styles
             logger.info("Extracting comprehensive styles...")
-            computed_styles_str = await get_comprehensive_styles(page)
+            computed_styles_json, computed_styles_str = await get_comprehensive_styles(page)
 
             # Get the HTML content
             content = await page.content()
@@ -373,11 +446,19 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str]:
             screenshot_base64 = base64.b64encode(screenshot_bytes).decode('utf-8')
             logger.info(f"Screenshot size: {len(screenshot_base64)} chars")
 
-            # Clean and parse HTML
+            # Rewrite <img> tags after downloading images
+            # Parse and clean
             soup = BeautifulSoup(content, 'html.parser')
-
-            # Clean HTML while preserving structure
             cleaned_html = clean_html_preserve_structure(soup)
+
+            # Extract image map from original soup before rewriting
+            image_map = extract_and_download_images(soup, url)  # ✅ This is the missing line
+
+            # Rewrite image srcs
+            soup = BeautifulSoup(cleaned_html, 'html.parser')
+            soup = rewrite_image_sources(soup, image_map)
+            cleaned_html = str(soup)
+
 
             # Extract inline <style> tags and linked stylesheets with better parsing
             styles = soup.find_all('style')
@@ -423,4 +504,79 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str]:
         finally:
             await browser.close()
 
-        return cleaned_html, screenshot_base64, layout_summary, style_text, visible_text_summary, computed_styles_str
+        return cleaned_html, screenshot_base64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json
+
+def extract_class_color_mapping(computed_styles: str) -> dict:
+    class_color_map = {}
+
+    current_class = None
+
+    for line in computed_styles.split("\n"):
+        line = line.strip()
+
+        # Detect class or ID selector
+        if line.startswith(".") or line.startswith("#"):
+            current_class = line.split()[0].strip("{").strip()
+            if current_class not in class_color_map:
+                class_color_map[current_class] = {"background": None, "text": None}
+
+        # Capture background color
+        if "background-color" in line and "rgb" in line and current_class:
+            color_match = re.search(r"rgb[a]?\([^)]+\)", line)
+            if color_match:
+                class_color_map[current_class]["background"] = color_match.group()
+
+        # Capture text color
+        if "color:" in line and "rgb" in line and current_class:
+            color_match = re.search(r"rgb[a]?\([^)]+\)", line)
+            if color_match:
+                class_color_map[current_class]["text"] = color_match.group()
+
+    # Filter to classes with at least one color
+    clean_map = {
+        k: v for k, v in class_color_map.items()
+        if v["background"] or v["text"]
+    }
+
+    return clean_map
+
+def extract_and_download_images(soup: BeautifulSoup, base_url: str, output_folder="static/images") -> dict:
+    os.makedirs(output_folder, exist_ok=True)
+    image_map = {}
+
+    for idx, img_tag in enumerate(soup.find_all("img")):
+        src = img_tag.get("src")
+        if not src:
+            continue
+
+        # Resolve relative URLs
+        full_url = urljoin(base_url, src)
+        parsed = urlparse(full_url)
+        filename = os.path.basename(parsed.path)
+
+        # Prevent empty filenames
+        if not filename:
+            filename = f"img_{idx}.png"
+        else:
+            filename = f"{idx}_{filename}"
+
+        local_path = os.path.join(output_folder, filename)
+        try:
+            if full_url.startswith("data:"):
+                continue  # Skip base64 inline images
+            response = requests.get(full_url, timeout=5)
+            with open(local_path, "wb") as f:
+                f.write(response.content)
+            image_map[src] = f"/static/images/{filename}"
+        except Exception as e:
+            continue
+
+    return image_map
+
+def rewrite_image_sources(soup: BeautifulSoup, image_map: dict) -> BeautifulSoup:
+    for img_tag in soup.find_all("img"):
+        src = img_tag.get("src")
+        if src and src in image_map:
+            img_tag["src"] = image_map[src]
+    return soup
+

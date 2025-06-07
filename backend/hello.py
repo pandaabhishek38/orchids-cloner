@@ -7,12 +7,13 @@ import uvicorn
 from app.rendered_scraper import get_rendered_html
 from fastapi import HTTPException
 from collections import Counter
-from collections import defaultdict
 import logging
 import re
 import os
 import requests
+import json
 from dotenv import load_dotenv
+from fastapi.staticfiles import StaticFiles
 
 load_dotenv()
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
@@ -27,6 +28,9 @@ app = FastAPI(
     version="1.0.0"
 )
 
+# Serve static files from the 'static' directory
+app.mount("/static", StaticFiles(directory="static"), name="static")
+
 # Add CORS middleware
 app.add_middleware(
     CORSMiddleware,
@@ -38,6 +42,31 @@ app.add_middleware(
 
 class CloneRequest(BaseModel):
     url: str
+
+def extract_visual_color_map(computed_styles_str: str) -> dict:
+    color_map = {}
+
+    try:
+        style_entries = json.loads(computed_styles_str)
+        for entry in style_entries:
+            selector = entry.get("selector")
+            if not selector:
+                continue
+
+            bg = entry.get("backgroundColor")
+            text = entry.get("color")
+
+            if (bg and bg != "transparent") or (text and text != "inherit"):
+                color_map[selector] = {
+                    "background": bg,
+                    "text": text
+                }
+
+    except Exception as e:
+        logger.warning(f"Failed to parse computed_styles JSON: {e}")
+
+    return color_map
+
 
 def generate_html_phased(prompt_parts: dict, screenshot_b64: str) -> str:
     headers = {
@@ -55,6 +84,9 @@ Screenshot:
 
 Layout Summary:
 {prompt_parts['layout_summary']}
+
+JavaScript Interactions Summary:
+{prompt_parts['js_summary']}
 
 Visible Content Summary:
 {prompt_parts['visible_text']}
@@ -90,12 +122,17 @@ Output only raw HTML with semantic tags (header, main, section, nav, footer, etc
 
     # Phase 2: Styling
     styling_prompt = f"""
-You are a frontend developer. Apply internal CSS to the following raw HTML layout using the provided design system. Your goal is to recreate the original look and feel of the target website.
+You are a frontend developer.
 
-🎨 Color Palette:
-- Apply the most dominant background color to the <body> or <main>
-- Use secondary background colors for <nav>, <footer>, and section blocks
-- Assign text colors to <p>, <a>, and all heading tags
+Your task is to apply internal CSS styles to the following raw HTML layout, based on:
+- 📷 The provided screenshot of the original website
+- 🧱 The semantic HTML structure generated in Phase 1
+- 🎨 The extracted design tokens (colors, typography, spacing, layout)
+
+Your goal is to recreate the original visual appearance and feel of the target website.
+
+🎨 Section + Class Colors:
+Apply the following CSS rules to their corresponding elements. Section tags (like `header`, `footer`, etc.) should use the section styles. Class selectors apply to elements using those classes.
 {prompt_parts['color_summary']}
 
 🔤 Typography:
@@ -112,12 +149,15 @@ You are a frontend developer. Apply internal CSS to the following raw HTML layou
 - Keep spacing consistent across buttons, headers, and content areas
 {prompt_parts['spacing_tokens']}
 
+🎮 JavaScript Interactions:
+Try to visually reflect these interactive elements where possible (e.g. sliders, modals, dropdowns):
+{prompt_parts['js_summary']}
+
 🛠 Instructions:
 - Insert a <style> tag inside the <head> of the HTML
 - Apply styles using CSS selectors — not inline styles
 - Add class names if necessary for cleaner styling
 - **Do not alter the HTML structure**
-- Style should be visible and representative of a real website
 
 ✅ Final Check:
 Before submitting:
@@ -125,9 +165,10 @@ Before submitting:
 - Apply all key colors and fonts
 - Visually style at least one heading, one link, one button, and one section
 
-Here is the HTML layout:
+📄 HTML Layout to Style:
 {phase1_html}
 """
+
 
     logger.info("Starting Phase 2: Styling")
 
@@ -135,21 +176,54 @@ Here is the HTML layout:
         "model": "claude-3-opus-20240229",
         "max_tokens": 3500,
         "temperature": 0.7,
-        "messages": [{"role": "user", "content": styling_prompt}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": styling_prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64
+                        }
+                    }
+                ]
+            }
+        ]
     })
     phase2_html = phase2.json()["content"][0]["text"]
     logger.info(f"Phase 2 HTML length: {len(phase2_html)}")
 
     # Phase 3: Content Filling
     content_prompt = f"""
-You are a web content assistant. Fill in the text content into the following HTML structure. Preserve the layout and styles. Use this visible content summary:
+You are a web content assistant.
 
+This is Phase 3 of a 3-phase cloning process. You are given:
+- A screenshot of the original website (for spatial and visual context)
+- A styled HTML layout generated in Phase 2
+- A visible text summary extracted from the original site
+- A summary of JavaScript behaviors
+
+Your job is to **insert the correct textual content** into the appropriate sections of the HTML, using the screenshot and visible summary to guide placement.
+
+📄 Visible Content Summary:
 {prompt_parts['visible_text']}
 
-Do not change the HTML structure or styles. Just insert the correct content into the appropriate sections.
+🎮 JavaScript Interactions (for context only):
+{prompt_parts['js_summary']}
 
-HTML:
+🧱 HTML Layout (from Phase 2):
 {phase2_html}
+
+🛠 Instructions:
+- DO NOT change the HTML structure or the <style> block
+- DO NOT generate extra styles or placeholder content
+- Just fill in real content where it belongs, preserving layout and visual integrity
+
+✅ Final Output:
+A complete HTML page with content placed accurately into the given layout, matching the original site.
 """
 
     logger.info("Starting Phase 3: Content Filling")
@@ -158,7 +232,22 @@ HTML:
         "model": "claude-3-opus-20240229",
         "max_tokens": 3500,
         "temperature": 0.7,
-        "messages": [{"role": "user", "content": content_prompt}]
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": content_prompt},
+                    {
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": screenshot_b64
+                        }
+                    }
+                ]
+            }
+        ]
     })
     final_html = phase3.json()["content"][0]["text"]
     logger.info(f"Final HTML length: {len(final_html)}")
@@ -269,40 +358,6 @@ def summarize_typography(computed_styles: str) -> dict:
     }
 
 
-def summarize_color_palette(computed_styles: str) -> dict:
-    bg_colors = []
-    text_colors = []
-    link_colors = []
-
-    for line in computed_styles.split("\n"):
-        line = line.strip()
-
-        if "background-color" in line and "rgb" in line:
-            color = re.search(r"rgb[a]?\([^)]+\)", line)
-            if color:
-                bg_colors.append(color.group())
-
-        elif re.match(r"\s*color\s*:\s*rgb", line):
-            color = re.search(r"rgb[a]?\([^)]+\)", line)
-            if color:
-                text_colors.append(color.group())
-
-        elif "a {" in line or "a:" in line:
-            if "color:" in line:
-                color = re.search(r"rgb[a]?\([^)]+\)", line)
-                if color:
-                    link_colors.append(color.group())
-
-    top_bg = Counter(bg_colors).most_common(3)
-    top_text = Counter(text_colors).most_common(3)
-    top_links = Counter(link_colors).most_common(3)
-
-    return {
-        "background_colors": [c[0] for c in top_bg],
-        "text_colors": [c[0] for c in top_text],
-        "link_colors": [c[0] for c in top_links]
-    }
-
 def generate_html_with_claude(prompt: str, screenshot_b64: str) -> str:
     headers = {
         "x-api-key": ANTHROPIC_API_KEY,
@@ -379,7 +434,7 @@ def extract_section_styles(computed_styles: str) -> dict:
             continue
 
         # Extract colors and fonts for current section
-        if 'background-color:' in line and 'rgb' in line:
+        if ("background-color" in line or "background:" in line) and "rgb" in line:
             color = line.split(':')[1].strip().rstrip(';')
             if 'rgba(0, 0, 0, 0)' not in color and color not in sections[current_section]['bg']:
                 sections[current_section]['bg'].append(color)
@@ -513,10 +568,10 @@ async def clone_site(request: CloneRequest):
         logger.info(f"Starting to clone: {request.url}")
 
         # Get rendered HTML and other data
-        rendered_html, screenshot_b64, layout_summary, style_text, visible_text_summary, computed_styles_str = await get_rendered_html(request.url)
+        rendered_html, screenshot_b64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json = await get_rendered_html(request.url)
 
-        palette = summarize_color_palette(computed_styles_str)
-        logger.info(f"Color palette: {palette}")
+        visual_color_map = extract_visual_color_map(computed_styles_str)
+        logger.info(f"Class-based color map: {visual_color_map}")
 
         typography = summarize_typography(computed_styles_str)
         logger.info(f"Typography summary: {typography}")
@@ -527,12 +582,69 @@ async def clone_site(request: CloneRequest):
         spacing_info = summarize_spacing_system(computed_styles_str)
         logger.info(f"Spacing system: {spacing_info}")
 
-        color_summary = f"""
-        DESIGN SYSTEM:
-        - Primary background colors: {', '.join(palette['background_colors'])}
-        - Primary text colors: {', '.join(palette['text_colors'])}
-        - Link colors: {', '.join(palette['link_colors'])}
-        """
+        # ---- Build unified color summary ----
+        color_summary = "/* COMPREHENSIVE STYLES - PRIMARY COLORS */\n"
+
+        priority_patterns = ['.btn', '.button', '.nav', '.header', '.footer', '.hero', '.banner', '.card']
+        skip_selectors = ['div', 'span', 'p', 'a', 'body', '[style*="background"]', '[style*="color"]']
+        seen = set()
+
+        # Split selectors into important and regular
+        important_selectors = []
+        regular_selectors = []
+
+        for item in computed_styles_json:
+            selector = item.get("selector", "").strip()
+            if not selector:
+                continue
+
+            if any(p in selector.lower() for p in priority_patterns):
+                important_selectors.append(item)
+            else:
+                regular_selectors.append(item)
+
+        # Combine and process
+        for item in important_selectors + regular_selectors[:10]:  # Limit regulars for clarity
+            selector = item.get("selector", "").strip()
+            background = item.get("backgroundColor")
+            text_color = item.get("color")
+
+            # 🛑 Skip generic or useless selectors
+            if selector in skip_selectors:
+                continue
+
+            # 🧼 Clean meaningless color values
+            if background in ["transparent", "rgba(0, 0, 0, 0)", "inherit", "initial"]:
+                background = None
+            if text_color in ["inherit", "initial", "currentcolor"]:
+                text_color = None
+
+            if not background and not text_color:
+                continue
+
+            # ✅ Deduplicate
+            key = (selector, background, text_color)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # ✅ Format
+            css_lines = [f"{selector} {{"]
+            if background:
+                css_lines.append(f"  background-color: {background};")
+            if text_color:
+                css_lines.append(f"  color: {text_color};")
+            css_lines.append("}")
+
+            color_summary += "\n".join(css_lines) + "\n"
+
+        # ✳️ Add fallback section styles
+        color_summary += "\n\n/* SECTION FALLBACKS */\n"
+        for section, colors in section_colors.items():
+            bg = colors.get("background", "transparent")
+            text = colors.get("text", "inherit")
+            color_summary += f"{section} {{ background-color: {bg}; color: {text}; }}\n"
+
         typography_summary = f"""
         TYPOGRAPHY SYSTEM:
         - Font families: {', '.join(typography['font_families'])}
@@ -547,34 +659,6 @@ async def clone_site(request: CloneRequest):
         SPACING SYSTEM:
         - Common margins: {', '.join(spacing_info['common_margins'])}
         - Common paddings: {', '.join(spacing_info['common_paddings'])}
-        """
-
-
-        # Construct multimodal prompt
-        multimodal_prompt = f"""
-        You are an expert web UI designer.
-
-        Here is a base64 screenshot of the target website:
-        [screenshot]
-        {"" if not screenshot_b64 else screenshot_b64[:100]}... (truncated)
-
-        Layout Summary:
-        {layout_summary}
-
-        Extracted CSS Styles:
-        {style_text[:1000]}...
-
-        Visible Content Summary:
-        {visible_text_summary}
-
-        {color_summary}
-        {typography_summary}
-        {layout_summary_text}
-        {spacing_summary_text}
-
-
-        Task:
-        Generate a single HTML file that replicates the original website's visual layout, structure, and styling as closely as possible. Use the screenshot to preserve spatial hierarchy and design. Use the layout summary and CSS to guide structure. Use visible content text where appropriate.
         """
 
 
@@ -600,14 +684,39 @@ async def clone_site(request: CloneRequest):
 
         logger.info(f"Prompt created, length: {len(prompt)}")
 
+        # 🔸 Extract top 5 visually important selectors for emphasis
+        primary_colors = []
+        priority_patterns = ['.btn', '.button', '.nav', '.header', '.footer', '.hero', '.banner', '.card']
+        highlighted = 0
+
+        for item in computed_styles_json:
+            selector = item.get("selector", "")
+            bg = item.get("backgroundColor")
+            text = item.get("color")
+
+            if any(p in selector.lower() for p in priority_patterns):
+                if bg or text:
+                    primary_colors.append(f"{selector}: bg={bg}, text={text}")
+                    highlighted += 1
+            if highlighted >= 5:
+                break
+        color_emphasis = f"""
+        🎨 KEY COLORS (Apply these first):
+        {chr(10).join(primary_colors)}
+
+        🎨 COMPLETE COLOR SYSTEM:
+        {color_summary}
+        """
+
         # Generate HTML using the LLM
         prompt_parts = {
             "layout_summary": layout_summary,
-            "color_summary": color_summary,
+            "color_summary": color_emphasis,
             "typography_summary": typography_summary,
             "layout_tokens": layout_summary_text,
             "spacing_tokens": spacing_summary_text,
-            "visible_text": visible_text_summary
+            "visible_text": visible_text_summary,
+            "js_summary": js_behavior_summary,
         }
         html = generate_html_phased(prompt_parts, screenshot_b64)
 
