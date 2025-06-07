@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import re
 import logging
 import os
+import json
 import requests
 from urllib.parse import urljoin, urlparse
 
@@ -11,7 +12,7 @@ from urllib.parse import urljoin, urlparse
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def summarize_layout(soup: BeautifulSoup) -> str:
+def summarize_layout_counts(soup: BeautifulSoup) -> str:
     layout = []
 
     if soup.find('header'):
@@ -42,6 +43,34 @@ def summarize_layout(soup: BeautifulSoup) -> str:
     layout.append(f"{len(images)} images found")
 
     return " | ".join(layout)
+
+def extract_layout_structure(soup: BeautifulSoup) -> dict:
+    """
+    Analyze the DOM to infer structural layout zones and their key children.
+    Returns a dictionary mapping layout zones to tag/class summaries.
+    """
+    layout_structure = {}
+
+    zones = {
+        "header": soup.find("header"),
+        "nav": soup.find("nav"),
+        "main": soup.find("main"),
+        "footer": soup.find("footer"),
+        "sidebar": soup.find(class_=re.compile("sidebar|aside|complementary")),
+    }
+
+    for zone_name, zone_elem in zones.items():
+        if zone_elem:
+            children = zone_elem.find_all(recursive=False)
+            layout_structure[zone_name] = []
+
+            for child in children:
+                tag = child.name
+                class_str = "." + ".".join(child.get("class", [])) if child.get("class") else ""
+                layout_structure[zone_name].append(f"{tag}{class_str}")
+
+    return layout_structure
+
 
 def clean_html_preserve_structure(soup: BeautifulSoup) -> str:
     """Clean HTML while preserving important structural information"""
@@ -160,14 +189,25 @@ async def get_comprehensive_styles(page) -> str:
                             textDecoration: styles.textDecoration,
                             textTransform: styles.textTransform,
                             letterSpacing: styles.letterSpacing,
-                            opacity: styles.opacity,
                             zIndex: styles.zIndex,
                             flexDirection: styles.flexDirection,
                             justifyContent: styles.justifyContent,
                             alignItems: styles.alignItems,
                             gridTemplateColumns: styles.gridTemplateColumns,
                             gridGap: styles.gridGap,
-                            cssVariables: getCSSVariables(element)
+                            cssVariables: getCSSVariables(element),
+                            order: styles.order,
+                            visibility: styles.visibility,
+                            opacity: styles.opacity,
+                            gap: styles.gap,
+                            rowGap: styles.rowGap,
+                            columnGap: styles.columnGap,
+                            outline: styles.outline,
+                            overflow: styles.overflow,
+                            overflowX: styles.overflowX,
+                            overflowY: styles.overflowY,
+                            isolation: styles.isolation,
+                            boxSizing: styles.boxSizing
                         };
 
                         // Get styles for pseudo-elements
@@ -484,13 +524,17 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str, str
                 style_text += "\n\n/* INLINE STYLES */\n" + "\n".join(inline_styles)
 
             # Get layout summary
+            # Get layout counts + structure
             logger.info("Extracting layout summary...")
-            layout_summary = summarize_layout(soup)
+            layout_summary = summarize_layout_counts(soup)  # renamed version of old function
+            layout_structure = extract_layout_structure(soup)  # new structured summary
 
             logger.info(f"Cleaned HTML length: {len(cleaned_html)}")
             logger.info(f"Extracted styles length: {len(style_text)}")
             logger.info(f"Computed styles length: {len(computed_styles_str)}")
-            logger.info(f"Layout summary: {layout_summary}")
+            logger.info(f"Layout summary (counts): {layout_summary}")
+            logger.info(f"Layout structure (zones): {json.dumps(layout_structure, indent=2)}")
+
 
         except Exception as e:
             logger.error(f"Playwright error: {str(e)}")
@@ -504,7 +548,7 @@ async def get_rendered_html(url: str) -> tuple[str, str, str, str, str, str, str
         finally:
             await browser.close()
 
-        return cleaned_html, screenshot_base64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json
+        return cleaned_html, screenshot_base64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json, layout_structure
 
 def extract_class_color_mapping(computed_styles: str) -> dict:
     class_color_map = {}

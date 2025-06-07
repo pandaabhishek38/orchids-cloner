@@ -85,6 +85,9 @@ Screenshot:
 Layout Summary:
 {prompt_parts['layout_summary']}
 
+Layout Structure (semantic zones):
+{prompt_parts['layout_structure']}
+
 JavaScript Interactions Summary:
 {prompt_parts['js_summary']}
 
@@ -568,7 +571,7 @@ async def clone_site(request: CloneRequest):
         logger.info(f"Starting to clone: {request.url}")
 
         # Get rendered HTML and other data
-        rendered_html, screenshot_b64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json = await get_rendered_html(request.url)
+        rendered_html, screenshot_b64, layout_summary, style_text, visible_text_summary, computed_styles_str, js_behavior_summary, section_colors, computed_styles_json, layout_structure = await get_rendered_html(request.url)
 
         visual_color_map = extract_visual_color_map(computed_styles_str)
         logger.info(f"Class-based color map: {visual_color_map}")
@@ -711,6 +714,7 @@ async def clone_site(request: CloneRequest):
         # Generate HTML using the LLM
         prompt_parts = {
             "layout_summary": layout_summary,
+            "layout_structure": layout_structure,
             "color_summary": color_emphasis,
             "typography_summary": typography_summary,
             "layout_tokens": layout_summary_text,
